@@ -1,193 +1,169 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+import "@openzeppelin/contracts/utils/structs/DoubleEndedQueue.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
+
 import "./WZND.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract OrderbookDEX is Ownable {
-    WZND public wznd;
-    address public treasury;
-    uint256 public makerFeeBasisPoints = 10; // 0.1%
-    uint256 public takerFeeBasisPoints = 10; // 0.1%
-    uint256 public orderCount;
+/// @title  Minimal on‑chain limit‑order orderbook (ETH ↔ wZND)
+/// @notice Pure solidity – no oracles, no off‑chain matching.
+///         Gas‑optimised constant‑memory queues per price tick.
+contract OrderbookDEX is ReentrancyGuard {
+    using DoubleEndedQueue for DoubleEndedQueue.Bytes32Deque;
 
-    enum OrderType { Buy, Sell }
+    // --- immutables -------------------------------------------------------
+    WZND  public immutable WZND_TOKEN;
+    uint8 public constant PRICE_DECIMALS = 8;  // 1e‑8 ETH granularity
 
+    constructor(WZND wznd) { WZND_TOKEN = wznd; }
+
+    // --- order struct -----------------------------------------------------
     struct Order {
-        uint256 id;
-        OrderType orderType;
-        address user;
-        uint256 amountZND;    // Amount of ZND to buy/sell
-        uint256 priceETH;     // Price per ZND in ETH
-        bool isActive;
+        uint128 amount;      // amount of wZND
+        uint128 price;       // ETH per wZND * 1e8
+        address maker;
+        bool    isBuy;       // true = bid (ETH→wZND), false = ask
     }
 
-    // Mapping from order ID to Order details
+    uint256 public nextOrderId;
     mapping(uint256 => Order) public orders;
 
-    // Events
-    event OrderPlaced(uint256 indexed id, OrderType orderType, address indexed user, uint256 amountZND, uint256 priceETH);
-    event OrderMatched(uint256 indexed buyOrderId, uint256 indexed sellOrderId, address indexed buyer, address seller, uint256 amountZND, uint256 priceETH);
+    // price‑level queues
+    mapping(uint128 => DoubleEndedQueue.Bytes32Deque) internal bids; // highest‑price first
+    mapping(uint128 => DoubleEndedQueue.Bytes32Deque) internal asks; // lowest‑price first
+
+    // --- events -----------------------------------------------------------
+    event OrderPlaced(
+        uint256 indexed id,
+        address indexed maker,
+        bool    isBuy,
+        uint128 amount,
+        uint128 price
+    );
+
+    event OrderFilled(
+        uint256 indexed id,
+        address indexed taker,
+        uint128 amount,
+        uint128 price
+    );
+
     event OrderCancelled(uint256 indexed id);
 
-    /**
-     * @dev Initializes the DEX with the `wZND` token and `treasury` address.
-     * @param _wznd The address of the wZND token contract.
-     * @param _treasury The address where fees are collected.
-     */
-    constructor(address _wznd, address _treasury) Ownable(msg.sender) {
-        require(_wznd != address(0), "OrderbookDEX: wZND address cannot be zero");
-        require(_treasury != address(0), "OrderbookDEX: treasury address cannot be zero");
-        wznd = WZND(_wznd);
-        treasury = _treasury;
+    // --- helpers ----------------------------------------------------------
+    function _enqueue(
+        mapping(uint128 => DoubleEndedQueue.Bytes32Deque) storage book,
+        uint128 price,
+        uint256 id
+    ) private {
+        book[price].pushBack(bytes32(id));
     }
 
-    /**
-     * @dev Updates the treasury address. Only callable by the contract owner.
-     * @param _treasury The new treasury address.
-     */
-    function setTreasury(address _treasury) external onlyOwner {
-        require(_treasury != address(0), "OrderbookDEX: treasury address cannot be zero");
-        treasury = _treasury;
+    function _dequeue(
+        mapping(uint128 => DoubleEndedQueue.Bytes32Deque) storage book,
+        uint128 price
+    ) private returns (uint256 id) {
+        id = uint256(book[price].popFront());
     }
 
-    /**
-     * @dev Places a new buy or sell order.
-     * @param _type The type of order: Buy or Sell.
-     * @param amountZND The amount of ZND to buy or sell.
-     * @param priceETH The price per ZND in ETH.
-     */
-    function placeOrder(OrderType _type, uint256 amountZND, uint256 priceETH) external payable {
-        require(amountZND > 0, "OrderbookDEX: amount must be greater than zero");
-        require(priceETH > 0, "OrderbookDEX: price must be greater than zero");
+    // --- place order ------------------------------------------------------
+    function placeOrder(
+        bool    isBuy,
+        uint128 amount,
+        uint128 price        // ETH per wZND * 1e‑8
+    )
+        external
+        payable
+        nonReentrant
+        returns (uint256 id)
+    {
+        require(amount > 0, "amount=0");
+        require(price  > 0, "price=0");
 
-        if (_type == OrderType.Buy) {
-            uint256 totalCost = amountZND * priceETH;
-            require(msg.value >= totalCost, "OrderbookDEX: insufficient ETH sent");
-            if (msg.value > totalCost) {
-                payable(msg.sender).transfer(msg.value - totalCost);
-            }
+        if (isBuy) {
+            // buyer escrows ETH
+            uint256 cost = (uint256(amount) * price) / 1e8;
+            require(msg.value == cost, "bad-eth");
         } else {
-            require(wznd.balanceOf(msg.sender) >= amountZND, "OrderbookDEX: insufficient wZND balance");
-            require(wznd.allowance(msg.sender, address(this)) >= amountZND, "OrderbookDEX: insufficient allowance");
-            require(wznd.transferFrom(msg.sender, address(this), amountZND), "OrderbookDEX: transferFrom failed");
+            // seller escrows wZND
+            WZND_TOKEN.transferFrom(msg.sender, address(this), amount);
         }
 
-        orderCount += 1;
-        orders[orderCount] = Order({
-            id: orderCount,
-            orderType: _type,
-            user: msg.sender,
-            amountZND: amountZND,
-            priceETH: priceETH,
-            isActive: true
+        id = ++nextOrderId;
+        orders[id] = Order({
+            amount  : amount,
+            price   : price,
+            maker   : msg.sender,
+            isBuy   : isBuy
         });
 
-        emit OrderPlaced(orderCount, _type, msg.sender, amountZND, priceETH);
+        _enqueue(isBuy ? bids : asks, price, id);
+        emit OrderPlaced(id, msg.sender, isBuy, amount, price);
+
+        // naive auto‑matching (one hop); full crossing left for v2
+        _tryMatch(id);
     }
 
-    /**
-     * @dev Matches an existing order with compatible opposite orders.
-     * @param orderId The ID of the order to match.
-     */
-    function matchOrder(uint256 orderId) external payable {
-        Order storage order = orders[orderId];
-        require(order.isActive, "OrderbookDEX: order is not active");
+    // --- cancel -----------------------------------------------------------
+    function cancel(uint256 id) external nonReentrant {
+        Order storage o = orders[id];
+        require(o.maker == msg.sender, "!maker");
 
-        if (order.orderType == OrderType.Buy) {
-            // Find a matching sell order
-            for (uint256 i = 1; i <= orderCount; i++) {
-                Order storage sellOrder = orders[i];
-                if (sellOrder.isActive && sellOrder.orderType == OrderType.Sell && sellOrder.priceETH <= order.priceETH) {
-                    _executeTrade(order, sellOrder);
-                    break;
-                }
-            }
+        // refund
+        if (o.isBuy) {
+            uint256 refund = (uint256(o.amount) * o.price) / 1e8;
+            payable(o.maker).transfer(refund);
         } else {
-            // Find a matching buy order
-            for (uint256 i = 1; i <= orderCount; i++) {
-                Order storage buyOrder = orders[i];
-                if (buyOrder.isActive && buyOrder.orderType == OrderType.Buy && buyOrder.priceETH >= order.priceETH) {
-                    _executeTrade(buyOrder, order);
-                    break;
-                }
-            }
+            WZND_TOKEN.transfer(o.maker, o.amount);
         }
+
+        delete orders[id];
+        emit OrderCancelled(id);
     }
 
-    /**
-     * @dev Cancels an active order. Only the order creator can cancel.
-     * @param orderId The ID of the order to cancel.
-     */
-    function cancelOrder(uint256 orderId) external {
-        Order storage order = orders[orderId];
-        require(order.isActive, "OrderbookDEX: order is not active");
-        require(order.user == msg.sender, "OrderbookDEX: not your order");
+    // --- internal match ---------------------------------------------------
+    function _tryMatch(uint256 takerId) private {
+        Order storage taker = orders[takerId];
+        if (taker.amount == 0) return;                         // already filled
 
-        if (order.orderType == OrderType.Buy) {
-            uint256 refundETH = order.amountZND * order.priceETH;
-            payable(order.user).transfer(refundETH);
+        mapping(uint128 => DoubleEndedQueue.Bytes32Deque) storage book =
+            taker.isBuy ? asks : bids;
+
+        // check best price level
+        uint128 priceLevel = taker.price;
+        if (book[priceLevel].empty()) return;
+
+        uint256 makerId = _dequeue(book, priceLevel);
+        Order storage maker = orders[makerId];
+        if (maker.amount == 0) return;                         // cancelled
+
+        uint128 tradeAmt = taker.amount < maker.amount
+            ? taker.amount
+            : maker.amount;
+
+        // transfer assets
+        if (taker.isBuy) {
+            // taker sends ETH already, receives wZND
+            WZND_TOKEN.transfer(taker.maker, tradeAmt);
+            // maker receives ETH
+            uint256 ethQty = (uint256(tradeAmt) * priceLevel) / 1e8;
+            payable(maker.maker).transfer(ethQty);
         } else {
-            require(wznd.transfer(order.user, order.amountZND), "OrderbookDEX: refund transfer failed");
+            // taker is seller
+            uint256 ethQty = (uint256(tradeAmt) * priceLevel) / 1e8;
+            payable(taker.maker).transfer(ethQty);
+            WZND_TOKEN.transfer(maker.maker, tradeAmt);
         }
 
-        order.isActive = false;
+        taker.amount -= tradeAmt;
+        maker.amount -= tradeAmt;
 
-        emit OrderCancelled(orderId);
+        emit OrderFilled(makerId, taker.maker, tradeAmt, priceLevel);
+        emit OrderFilled(takerId, maker.maker, tradeAmt, priceLevel);
     }
 
-    /**
-     * @dev Internal function to execute a trade between a buy order and a sell order.
-     * @param buyOrder The buy order.
-     * @param sellOrder The sell order.
-     */
-    function _executeTrade(Order storage buyOrder, Order storage sellOrder) internal {
-        uint256 matchedAmount = buyOrder.amountZND < sellOrder.amountZND ? buyOrder.amountZND : sellOrder.amountZND;
-        uint256 tradePrice = sellOrder.priceETH;
-
-        // Calculate fees
-        uint256 makerFee = matchedAmount * makerFeeBasisPoints / 10000;
-        uint256 takerFee = matchedAmount * takerFeeBasisPoints / 10000;
-        uint256 netAmount = matchedAmount - makerFee - takerFee;
-
-        // Transfer ETH from DEX to seller (minus taker fee)
-        uint256 totalETH = matchedAmount * tradePrice;
-        uint256 feeETH = totalETH * takerFeeBasisPoints / 10000;
-        uint256 sellerETH = totalETH - feeETH;
-        payable(sellOrder.user).transfer(sellerETH);
-        payable(treasury).transfer(feeETH); // Taker fee
-
-        // Transfer wZND from DEX to buyer (minus maker fee)
-        require(wznd.transfer(buyOrder.user, netAmount), "OrderbookDEX: wZND transfer failed");
-        require(wznd.transfer(treasury, makerFee), "OrderbookDEX: maker fee transfer failed");
-
-        // Update order amounts
-        buyOrder.amountZND = buyOrder.amountZND - matchedAmount;
-        sellOrder.amountZND = sellOrder.amountZND - matchedAmount;
-
-        // Deactivate orders if fully matched
-        if (buyOrder.amountZND == 0) {
-            buyOrder.isActive = false;
-        }
-        if (sellOrder.amountZND == 0) {
-            sellOrder.isActive = false;
-        }
-
-        emit OrderMatched(buyOrder.id, sellOrder.id, buyOrder.user, sellOrder.user, matchedAmount, tradePrice);
-    }
-
-    /**
-     * @dev Utility function to find the minimum of two numbers.
-     * @param a First number.
-     * @param b Second number.
-     * @return The smaller of `a` and `b`.
-     */
-    function min(uint256 a, uint256 b) internal pure returns (uint256) {
-        return a < b ? a : b;
-    }
-
-    /**
-     * @dev Allows the contract to receive ETH.
-     */
+    // --- fallback ---------------------------------------------------------
     receive() external payable {}
 }
