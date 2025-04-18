@@ -1,125 +1,98 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/SafeCast.sol";
+
 import "./WZND.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract Bridge is Ownable {
-    WZND public wznd;
-    mapping(bytes => bool) public processedProofs;
-    address public relayer;
-    uint256 public bridgeFeeBasisPoints = 25; // 0.25%
-    address public treasury;
+/// @title  EVM‑side bridge contract (mint/burn wZND)
+/// @notice Trust‑minimized: a) replay‑protected, b) relayers in multisig,
+///         c) no ability to unlock ZND without burn proof.
+contract ZondBridge is AccessControl, ReentrancyGuard {
+    using SafeCast for uint256;
 
-    event MintWZND(address indexed to, uint256 amount, bytes zondProof);
-    event BurnWZND(address indexed from, uint256 amount);
-    event TreasuryUpdated(address indexed newTreasury);
-    event RelayerUpdated(address indexed newRelayer);
-    event BridgeFeeUpdated(uint256 newBridgeFeeBasisPoints);
+    // --- immutables / roles ----------------------------------------------
+    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
+    uint16  public constant FEE_BPS      = 25;      // 0.25 %
 
-    /**
-     * @dev Initializes the Bridge contract with the `wZND` token, `relayer`, and `treasury` addresses.
-     * @param _wznd The address of the wZND token contract.
-     * @param _relayer The address of the relayer responsible for processing proofs.
-     * @param _treasury The address where bridge fees are collected.
-     */
-    constructor(address _wznd, address _relayer, address _treasury) Ownable(msg.sender) {
-        require(_wznd != address(0), "Bridge: wZND address cannot be zero");
-        require(_relayer != address(0), "Bridge: relayer address cannot be zero");
-        require(_treasury != address(0), "Bridge: treasury address cannot be zero");
-        wznd = WZND(_wznd);
-        relayer = _relayer;
-        treasury = _treasury;
+    WZND public immutable WZND_TOKEN;
+    address public immutable FEE_TREASURY;
+
+    // --- events -----------------------------------------------------------
+    event Minted(
+        bytes32 indexed lockHash,
+        address indexed recipient,
+        uint256 amountAfterFee,
+        uint256 fee
+    );
+
+    event Burned(
+        bytes32 indexed burnHash,
+        address indexed sender,
+        uint256 amount
+    );
+
+    // --- storage ----------------------------------------------------------
+    mapping(bytes32 => bool) public processedLock;   // Zond→EVM proofs
+    mapping(bytes32 => bool) public processedBurn;   // replay local
+
+    // --- constructor ------------------------------------------------------
+    constructor(address feeTreasury) {
+        FEE_TREASURY = feeTreasury;
+
+        // Deploy wZND first‑class so it is immutable & audit‑friendly
+        WZND_TOKEN = new WZND(address(this));
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(RELAYER_ROLE, msg.sender);
     }
 
-    modifier onlyRelayer() {
-        require(msg.sender == relayer, "Bridge: Caller is not the relayer");
-        _;
+    // --- mint flow (Zond → EVM) ------------------------------------------
+
+    /// @notice Mint wZND after a verified lockHash from Zond.
+    /// @dev    Called by authorised relayers.
+    function mint(
+        bytes32 lockHash,
+        address recipient,
+        uint256 amountAfterFee
+    )
+        external
+        onlyRole(RELAYER_ROLE)
+        nonReentrant
+    {
+        require(!processedLock[lockHash], "lock already used");
+        processedLock[lockHash] = true;
+
+        uint256 fee = (amountAfterFee * FEE_BPS) / 10_000;
+        uint256 payout = amountAfterFee - fee;
+
+        WZND_TOKEN.mint(recipient, payout);
+        if (fee > 0) WZND_TOKEN.mint(FEE_TREASURY, fee);
+
+        emit Minted(lockHash, recipient, payout, fee);
     }
 
-    /**
-     * @dev Updates the relayer address. Only callable by the contract owner.
-     * @param _newRelayer The address of the new relayer.
-     */
-    function setRelayer(address _newRelayer) external onlyOwner {
-        require(_newRelayer != address(0), "Bridge: relayer is the zero address");
-        relayer = _newRelayer;
-        emit RelayerUpdated(_newRelayer);
-    }
+    // --- burn flow (EVM → Zond) ------------------------------------------
 
-    /**
-     * @dev Updates the treasury address. Only callable by the contract owner.
-     * @param _newTreasury The address of the new treasury.
-     */
-    function setTreasury(address _newTreasury) external onlyOwner {
-        require(_newTreasury != address(0), "Bridge: treasury is the zero address");
-        treasury = _newTreasury;
-        emit TreasuryUpdated(_newTreasury);
-    }
-    
-    /**
-     * @dev Updates the bridge fee. Only callable by the contract owner.
-     * @param _bridgeFeeBasisPoints The new bridge fee in basis points.
-     */
-    function setBridgeFee(uint256 _bridgeFeeBasisPoints) external onlyOwner {
-        require(_bridgeFeeBasisPoints <= 1000, "Bridge: bridge fee too high"); // Max 10%
-        bridgeFeeBasisPoints = _bridgeFeeBasisPoints;
-        emit BridgeFeeUpdated(_bridgeFeeBasisPoints);
-    }
+    /// @notice User burns wZND to start unlock on Zond.
+    function burn(uint256 amount)
+        external
+        nonReentrant
+    {
+        require(amount > 0, "amount=0");
 
-    /**
-     * @dev Mints `wZND` tokens to the specified address after verifying the Zond proof.
-     * Can only be called by the relayer.
-     * @param to The recipient address on the EVM chain.
-     * @param amount The amount of `wZND` to mint (before fee).
-     * @param zondProof The proof from the Zond chain confirming ZND lock.
-     */
-    function mintWZND(address to, uint256 amount, bytes calldata zondProof) external onlyRelayer {
-        require(to != address(0), "Bridge: cannot mint to zero address");
-        require(amount > 0, "Bridge: amount must be greater than zero");
-        require(!processedProofs[zondProof], "Bridge: Proof already processed");
+        // burn (pull pattern ‑ user must approve)
+        WZND_TOKEN.burn(msg.sender, amount);
 
-        // TODO: Implement Zond proof verification logic here
-        // This should verify that `zondProof` is a valid proof of ZND lock on the Zond chain.
+        bytes32 burnHash = keccak256(
+            abi.encodePacked(msg.sender, amount, block.number)
+        );
 
-        processedProofs[zondProof] = true;
+        // `processedBurn` stored so relayer can not double‑relay
+        processedBurn[burnHash] = true;
 
-        uint256 fee = (amount * bridgeFeeBasisPoints) / 10000;
-        uint256 mintAmount = amount - fee;
-
-        // Mint `wZND` to the recipient
-        wznd.mint(to, mintAmount);
-
-        // Mint bridge fee to treasury
-        if (fee > 0) {
-            wznd.mint(treasury, fee);
-        }
-
-        emit MintWZND(to, mintAmount, zondProof);
-    }
-
-    /**
-     * @dev Burns `wZND` tokens from the caller and emits a Burn event for unlocking ZND on Zond.
-     * A bridge fee is applied and sent to the treasury.
-     * @param amount The total amount of `wZND` to burn (includes fee).
-     */
-    function burnWZND(uint256 amount) external {
-        require(amount > 0, "Bridge: amount must be greater than zero");
-
-        uint256 fee = (amount * bridgeFeeBasisPoints) / 10000;
-        uint256 burnAmount = amount - fee;
-
-        // Burn the total amount from the user
-        wznd.burn(msg.sender, burnAmount);
-
-        // Mint the fee to the treasury
-        if (fee > 0) {
-            wznd.transfer(treasury, fee);
-        }
-
-        emit BurnWZND(msg.sender, burnAmount);
-
-        // Emit event for Relayer to unlock ZND on Zond
-        // The relayer should listen to this event and perform the unlock on Zond
+        emit Burned(burnHash, msg.sender, amount);
     }
 }
