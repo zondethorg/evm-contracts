@@ -108,6 +108,11 @@ contract EthAtomicSwapTest is Test {
     function testLockERC20AndClaim() public {
         bytes32 swapID = _lockERC20();
 
+        // Verify swapID matches previewSwapID
+        bytes32 expectedSwapID = swap.previewSwapID(alice, hashSecret, bobAddrBytes);
+        assertEq(swapID, expectedSwapID);
+
+
         uint256 balBefore = token.balanceOf(bob);
         vm.prank(bob);
         swap.claim(swapID, abi.encodePacked(secret));
