@@ -57,7 +57,7 @@ contract EthAtomicSwapTest is Test {
         vm.prank(alice);
         swapID = swap.lock{value: amountEth}(
             hashSecret,
-            bobAddrBytes,
+            bob,
             block.timestamp + 1 days,
             address(0), // ETH
             0, // ignored for ETH
@@ -70,7 +70,7 @@ contract EthAtomicSwapTest is Test {
         vm.startPrank(alice);
         token.approve(address(swap), amountErc20);
         swapID = swap.lock(
-            hashSecret, bobAddrBytes, block.timestamp + 1 days, address(token), amountErc20, desiredAsset, desiredAmount
+            hashSecret, bob, block.timestamp + 1 days, address(token), amountErc20, desiredAsset, desiredAmount
         );
         vm.stopPrank();
     }
@@ -89,7 +89,7 @@ contract EthAtomicSwapTest is Test {
         swap.claim(swapID, abi.encodePacked(secret));
 
         assertEq(bob.balance, balBefore + amountEth);
-        (,,,,,,,, bool claimed) = swap.swaps(swapID);
+        (,,,,,,, bool claimed) = swap.swaps(swapID);
         assertTrue(claimed);
     }
 
@@ -97,7 +97,7 @@ contract EthAtomicSwapTest is Test {
         bytes32 swapID = _lockERC20();
 
         // Verify swapID matches previewSwapID
-        bytes32 expectedSwapID = swap.previewSwapID(alice, hashSecret, bobAddrBytes);
+        bytes32 expectedSwapID = swap.previewSwapID(alice, hashSecret, bob);
         assertEq(swapID, expectedSwapID);
 
         uint256 balBefore = token.balanceOf(bob);
@@ -105,7 +105,7 @@ contract EthAtomicSwapTest is Test {
         swap.claim(swapID, abi.encodePacked(secret));
 
         assertEq(token.balanceOf(bob), balBefore + amountErc20);
-        (,,,,,,,, bool claimed) = swap.swaps(swapID);
+        (,,,,,,, bool claimed) = swap.swaps(swapID);
         assertTrue(claimed);
     }
 
@@ -124,7 +124,7 @@ contract EthAtomicSwapTest is Test {
         swap.refund(swapID);
 
         assertEq(alice.balance, balBefore);
-        (,,,,,,,, bool claimed) = swap.swaps(swapID);
+        (,,,,,,, bool claimed) = swap.swaps(swapID);
         assertTrue(claimed);
     }
 
@@ -170,7 +170,7 @@ contract EthAtomicSwapTest is Test {
                        Preview ID Helper Check
     //////////////////////////////////////////////////////////////*/
     function testPreviewSwapIDMatches() public {
-        bytes32 predicted = swap.previewSwapID(alice, hashSecret, bobAddrBytes);
+        bytes32 predicted = swap.previewSwapID(alice, hashSecret, bob);
         bytes32 actual = _lockETH();
         assertEq(predicted, actual);
     }
