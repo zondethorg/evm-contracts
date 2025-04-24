@@ -29,21 +29,16 @@ contract EthAtomicSwap is Ownable, Pausable, ReentrancyGuard {
         // Asset the locker deposited on *this* chain
         address assetLocked;
         uint256 amountLocked;
-
         // Initiator (EVM address)
         address locker;
-
         // Counter‑party identifier on *other* chain
-        bytes   recipientRaw;      // arbitrary bytes (bech32, base58, etc.)
-        bytes32 recipientHash;     // keccak256(recipientRaw)
-
+        bytes recipientRaw; // arbitrary bytes (bech32, base58, etc.)
+        bytes32 recipientHash; // keccak256(recipientRaw)
         // What the locker expects back on the other chain
-        bytes   desiredAssetRaw;   // token/denom identifier in raw bytes
+        bytes desiredAssetRaw; // token/denom identifier in raw bytes
         uint256 desiredAmount;
-
         // Time after which refund() unlocks
         uint256 expiryTs;
-
         // Terminal flag to prevent double‑spend
         bool claimed;
     }
@@ -61,8 +56,8 @@ contract EthAtomicSwap is Ownable, Pausable, ReentrancyGuard {
         bytes32 indexed hashSecret,
         address indexed assetLocked,
         uint256 amountLocked,
-        bytes   recipientRaw,
-        bytes   desiredAssetRaw,
+        bytes recipientRaw,
+        bytes desiredAssetRaw,
         uint256 desiredAmount,
         uint256 expiryTs,
         address locker
@@ -121,19 +116,13 @@ contract EthAtomicSwap is Ownable, Pausable, ReentrancyGuard {
         uint256 amountLocked,
         bytes calldata desiredAssetRaw,
         uint256 desiredAmount
-    )
-        external
-        payable
-        whenNotPaused
-        nonReentrant
-        returns (bytes32 swapID)
-    {
+    ) external payable whenNotPaused nonReentrant returns (bytes32 swapID) {
         // --- validation ----------------------------------------------------
-        require(hashSecret != bytes32(0),        "AS: empty hash");
-        require(recipientRaw.length > 0,         "AS: empty recipient");
-        require(desiredAssetRaw.length > 0,      "AS: empty desiredAsset");
-        require(expiryTs > block.timestamp,      "AS: expiry in past");
-        require(desiredAmount > 0,               "AS: zero desired");
+        require(hashSecret != bytes32(0), "AS: empty hash");
+        require(recipientRaw.length > 0, "AS: empty recipient");
+        require(desiredAssetRaw.length > 0, "AS: empty desiredAsset");
+        require(expiryTs > block.timestamp, "AS: expiry in past");
+        require(desiredAmount > 0, "AS: zero desired");
 
         uint256 value;
         if (assetLocked == address(0)) {
@@ -150,27 +139,19 @@ contract EthAtomicSwap is Ownable, Pausable, ReentrancyGuard {
         require(swaps[swapID].locker == address(0), "AS: swap exists");
 
         swaps[swapID] = Swap({
-            assetLocked:      assetLocked,
-            amountLocked:     value,
-            locker:           msg.sender,
-            recipientRaw:     recipientRaw,
-            recipientHash:    recipientHash,
-            desiredAssetRaw:  desiredAssetRaw,
-            desiredAmount:    desiredAmount,
-            expiryTs:         expiryTs,
-            claimed:          false
+            assetLocked: assetLocked,
+            amountLocked: value,
+            locker: msg.sender,
+            recipientRaw: recipientRaw,
+            recipientHash: recipientHash,
+            desiredAssetRaw: desiredAssetRaw,
+            desiredAmount: desiredAmount,
+            expiryTs: expiryTs,
+            claimed: false
         });
 
         emit Locked(
-            swapID,
-            hashSecret,
-            assetLocked,
-            value,
-            recipientRaw,
-            desiredAssetRaw,
-            desiredAmount,
-            expiryTs,
-            msg.sender
+            swapID, hashSecret, assetLocked, value, recipientRaw, desiredAssetRaw, desiredAmount, expiryTs, msg.sender
         );
     }
 
@@ -179,22 +160,14 @@ contract EthAtomicSwap is Ownable, Pausable, ReentrancyGuard {
      * @param swapID Identifier obtained from the lock() event.
      * @param secret Original pre‑image whose SHA‑256 equals hashSecret.
      */
-    function claim(bytes32 swapID, bytes calldata secret)
-        external
-        whenNotPaused
-        nonReentrant
-        swapExists(swapID)
-    {
+    function claim(bytes32 swapID, bytes calldata secret) external whenNotPaused nonReentrant swapExists(swapID) {
         Swap storage s = swaps[swapID];
 
-        require(!s.claimed,                        "AS: already claimed");
-        require(block.timestamp <= s.expiryTs,     "AS: expired");
+        require(!s.claimed, "AS: already claimed");
+        require(block.timestamp <= s.expiryTs, "AS: expired");
 
         bytes32 hashSecret = sha256(secret);
-        require(
-            keccak256(abi.encodePacked(s.locker, hashSecret, s.recipientHash)) == swapID,
-            "AS: wrong secret"
-        );
+        require(keccak256(abi.encodePacked(s.locker, hashSecret, s.recipientHash)) == swapID, "AS: wrong secret");
 
         s.claimed = true;
 
@@ -211,17 +184,12 @@ contract EthAtomicSwap is Ownable, Pausable, ReentrancyGuard {
      * @notice Refund function callable by locker after expiry.
      * @param swapID Identifier obtained from lock() event.
      */
-    function refund(bytes32 swapID)
-        external
-        whenNotPaused
-        nonReentrant
-        swapExists(swapID)
-    {
+    function refund(bytes32 swapID) external whenNotPaused nonReentrant swapExists(swapID) {
         Swap storage s = swaps[swapID];
 
-        require(msg.sender == s.locker,            "AS: not locker");
-        require(!s.claimed,                        "AS: already claimed");
-        require(block.timestamp > s.expiryTs,      "AS: not expired");
+        require(msg.sender == s.locker, "AS: not locker");
+        require(!s.claimed, "AS: already claimed");
+        require(block.timestamp > s.expiryTs, "AS: not expired");
 
         s.claimed = true;
 
@@ -240,11 +208,11 @@ contract EthAtomicSwap is Ownable, Pausable, ReentrancyGuard {
     /**
      * @notice Pure helper to predict swapID off‑chain.
      */
-    function previewSwapID(
-        address locker,
-        bytes32 hashSecret,
-        bytes calldata recipientRaw
-    ) external pure returns (bytes32) {
+    function previewSwapID(address locker, bytes32 hashSecret, bytes calldata recipientRaw)
+        external
+        pure
+        returns (bytes32)
+    {
         return keccak256(abi.encodePacked(locker, hashSecret, keccak256(recipientRaw)));
     }
 }
